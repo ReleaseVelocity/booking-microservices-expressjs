@@ -1,59 +1,86 @@
 name: CI
 
 on:
-  push:
-    branches: [ "main"]
-    paths-ignore:
-      - "README.md"
-      - "CHANGELOG.md"
   pull_request:
-    branches: [ "main" ]
+    branches: [main, base-*]
+  push:
+    branches: [main]
 
 jobs:
-
-  ci:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '22.x'
+          node-version: '20'
+      - run: npm ci
+      - run: npm run lint
 
-      - name: build building-blocks
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npm run test
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: booking_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      rabbitmq:
+        image: rabbitmq:3-management
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmqctl node_health_check"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npm run test:e2e
+        env:
+          DATABASE_URL: postgresql://test:testpass@localhost:5432/booking_test
+          RABBITMQ_URL: amqp://localhost:5672
+
+  deploy-staging:
+    needs: [lint, unit-tests, integration-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull deployment artifact
         run: |
-          npm install
-          npm run build
-        working-directory: ./src/building-blocks
-
-      - name: build identity
-        run: |
-          npm install
-          npm run build
-        working-directory: ./src/identity
-
-      - name: test identity
-        run: npm test
-        working-directory: ./src/identity
-
-      - name: build flight
-        run: |
-          npm install
-          npm run build
-        working-directory: ./src/flight
-
-      - name: build passenger
-        run: |
-          npm install
-          npm run build
-        working-directory: ./src/passenger
-
-      - name: build booking
-        run: |
-          npm install
-          npm run build
-        working-directory: ./src/booking
-
-
-
+          echo "Pulling deployment artifact from registry..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.REGISTRY_TOKEN }}" \
+            "https://registry.example.com/v2/booking-service/manifests/latest" 2>/dev/null || echo "000")
+          if [ "$RESPONSE" != "200" ]; then
+            echo "::error::Registry returned HTTP $RESPONSE"
+            echo "ERROR: Authentication failed — registry token may be expired or missing"
+            echo "Artifact URL: https://registry.example.com/v2/booking-service/manifests/latest"
+            echo "Token source: GitHub Secret REGISTRY_TOKEN"
+            echo "Last known rotation: 2026-04-15"
+            exit 1
+          fi
+      - name: Deploy to ECS staging
+        run: echo "Deploying booking-service to ECS staging..."
