@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, base-*]
+  push:
+    branches: [main]
+
+jobs:
+  integration-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/booking
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: npm test
+
+  deploy-staging:
+    needs: [integration-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull deployment artifact
+        run: |
+          echo "Pulling deployment artifact from registry..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.REGISTRY_TOKEN }}" \
+            "https://registry.example.com/v2/booking-service/manifests/latest" 2>/dev/null || echo "000")
+          if [ "$RESPONSE" != "200" ]; then
+            echo "::error::Registry returned HTTP $RESPONSE"
+            echo "ERROR: Authentication failed — registry token may be expired or missing"
+            echo "Artifact URL: https://registry.example.com/v2/booking-service/manifests/latest"
+            echo "Token source: GitHub Secret REGISTRY_TOKEN"
+            echo "Last known rotation: 2026-04-15"
+            exit 1
+          fi
+      - name: Deploy to ECS staging
+        run: echo "Deploying booking-service to ECS staging..."
