@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, base-*]
+  push:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [booking, flight, identity, passenger]
+    defaults:
+      run:
+        working-directory: src/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # No package-lock.json is committed per service, so use `npm install`
+      # rather than `npm ci`. See README "How to Run" — each microservice is
+      # installed/built/tested from its own directory.
+      - run: npm install
+      - run: npm run lint
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [booking, flight, identity, passenger]
+    defaults:
+      run:
+        working-directory: src/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: npm run test
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [booking, flight, identity, passenger]
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: booking_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      rabbitmq:
+        image: rabbitmq:3-management
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmqctl node_health_check"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    defaults:
+      run:
+        working-directory: src/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      # No service currently defines a `test:e2e` script. The project uses
+      # testcontainers-driven integration tests within the standard `test`
+      # script (jest). Run `npm run test` here as well; this keeps integration
+      # coverage consistent and matches the per-service script set.
+      - run: npm run test
+        env:
+          DATABASE_URL: postgresql://test:testpass@localhost:5432/booking_test
+          RABBITMQ_URL: amqp://localhost:5672
+
+  deploy-staging:
+    needs: [lint, unit-tests, integration-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull deployment artifact
+        run: |
+          echo "Pulling deployment artifact from registry..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.REGISTRY_TOKEN }}" \
+            "https://registry.example.com/v2/booking-service/manifests/latest" 2>/dev/null || echo "000")
+          if [ "$RESPONSE" != "200" ]; then
+            echo "::error::Registry returned HTTP $RESPONSE"
+            echo "ERROR: Authentication failed — registry token may be expired or missing"
+            echo "Artifact URL: https://registry.example.com/v2/booking-service/manifests/latest"
+            echo "Token source: GitHub Secret REGISTRY_TOKEN"
+            echo "Last known rotation: 2026-04-15"
+            exit 1
+          fi
+      - name: Deploy to ECS staging
+        run: echo "Deploying booking-service to ECS staging..."
