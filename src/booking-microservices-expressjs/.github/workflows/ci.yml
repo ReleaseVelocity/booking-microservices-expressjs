@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, base-*]
+  push:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [building-blocks, identity, flight, passenger, booking]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # building-blocks is a file: dependency of every other service.
+      # Install it first so its node_modules is populated before the
+      # consuming service runs `npm install`.
+      - name: Install building-blocks (file dependency)
+        if: matrix.service != 'building-blocks'
+        working-directory: src/building-blocks
+        run: npm install --no-audit --no-fund
+      - name: Install service dependencies
+        working-directory: src/${{ matrix.service }}
+        run: npm install --no-audit --no-fund
+      - name: Lint
+        working-directory: src/${{ matrix.service }}
+        run: npm run lint
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # building-blocks does not define a `test` script; skip it here.
+        service: [identity, flight, passenger, booking]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install building-blocks (file dependency)
+        working-directory: src/building-blocks
+        run: npm install --no-audit --no-fund
+      - name: Install service dependencies
+        working-directory: src/${{ matrix.service }}
+        run: npm install --no-audit --no-fund
+      - name: Unit tests
+        working-directory: src/${{ matrix.service }}
+        run: npm test
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # No service defines a `test:e2e` script today; reuse `test` so
+        # integration-tests exercises each service against the live
+        # postgres/rabbitmq sidecars below. Switch back to `test:e2e`
+        # once each service implements it.
+        service: [identity, flight, passenger, booking]
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: booking_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      rabbitmq:
+        image: rabbitmq:3-management
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmqctl node_health_check"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install building-blocks (file dependency)
+        working-directory: src/building-blocks
+        run: npm install --no-audit --no-fund
+      - name: Install service dependencies
+        working-directory: src/${{ matrix.service }}
+        run: npm install --no-audit --no-fund
+      - name: Integration tests
+        working-directory: src/${{ matrix.service }}
+        run: npm test
+        env:
+          DATABASE_URL: postgresql://test:testpass@localhost:5432/booking_test
+          RABBITMQ_URL: amqp://localhost:5672
+
+  deploy-staging:
+    needs: [lint, unit-tests, integration-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull deployment artifact
+        run: |
+          echo "Pulling deployment artifact from registry..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.REGISTRY_TOKEN }}" \
+            "https://registry.example.com/v2/booking-service/manifests/latest" 2>/dev/null || echo "000")
+          if [ "$RESPONSE" != "200" ]; then
+            echo "::error::Registry returned HTTP $RESPONSE"
+            echo "ERROR: Authentication failed — registry token may be expired or missing"
+            echo "Artifact URL: https://registry.example.com/v2/booking-service/manifests/latest"
+            echo "Token source: GitHub Secret REGISTRY_TOKEN"
+            echo "Last known rotation: 2026-04-15"
+            exit 1
+          fi
+      - name: Deploy to ECS staging
+        run: echo "Deploying booking-service to ECS staging..."
